@@ -461,8 +461,9 @@ def main():
     val_loss, val_bpb = eval_val_bpb(
         model, val_tokens, HP.seq_len, device, base_lut, space_lut, boundary_lut,
     )
-    # Parameter-golf-compatible output line so eval/eval.sh regex matches:
-    print(f"final_int8_zlib_roundtrip_exact val_loss:{val_loss:.8f} val_bpb:{val_bpb:.8f}")
+    # eval/eval.sh regex requires no `:` between the marker and `val_bpb:`.
+    print(f"val_loss {val_loss:.8f}")
+    print(f"final_int8_zlib_roundtrip_exact val_bpb:{val_bpb:.8f}")
 
 
 if __name__ == "__main__":
