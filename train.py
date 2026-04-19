@@ -347,15 +347,38 @@ def eval_val_bpb(model, val_tokens: torch.Tensor, seq_len: int, device, base_byt
 # ----------------------------- quantize + save -----------------------------
 
 
-def save_model_compressed(model: nn.Module, path: str) -> int:
-    """Save model state dict in fp16, zlib-compressed. Returns file bytes.
+def _quantize_int8_rowwise(w: torch.Tensor):
+    # w: (R, C). Symmetric per-row int8 quant, fp16 scale per row.
+    scale = w.abs().amax(dim=1, keepdim=True).clamp(min=1e-8) / 127.0
+    q = (w / scale).round().clamp(-127, 127).to(torch.int8)
+    return q, scale.squeeze(1).to(torch.float16)
 
-    Agents: replace with int8 per-row + zlib for better compression; see
-    parameter-golf's quantize_state_dict_int8 as a reference.
-    """
-    sd = {k: v.detach().to(torch.float16).cpu() for k, v in model.state_dict().items()}
+
+def _dequantize_int8_rowwise(q: torch.Tensor, scale: torch.Tensor):
+    # q: (R, C) int8, scale: (R,) fp16 → dequantized fp32
+    return q.to(torch.float32) * scale.to(torch.float32).unsqueeze(1)
+
+
+def save_model_compressed(model: nn.Module, path: str) -> int:
+    """Int8 per-row quant for 2D params; fp16 for 1D. zlib-compressed."""
+    q_w, q_scale, fp16_w = {}, {}, {}
+    seen_ptr = set()
+    for k, v in model.state_dict().items():
+        vd = v.detach().cpu()
+        # Dedupe tied params by storage pointer.
+        ptr = vd.data_ptr()
+        if ptr in seen_ptr:
+            continue
+        seen_ptr.add(ptr)
+        if vd.dim() == 2 and vd.numel() >= 256:
+            q, s = _quantize_int8_rowwise(vd.to(torch.float32))
+            q_w[k] = q
+            q_scale[k] = s
+        else:
+            fp16_w[k] = vd.to(torch.float16)
+    blob_dict = {"q_w": q_w, "q_scale": q_scale, "fp16_w": fp16_w}
     buf = io.BytesIO()
-    torch.save(sd, buf)
+    torch.save(blob_dict, buf)
     blob = zlib.compress(buf.getvalue(), level=9)
     with open(path, "wb") as f:
         f.write(blob)
@@ -366,14 +389,27 @@ def load_model_compressed(path: str, model: nn.Module):
     with open(path, "rb") as f:
         blob = f.read()
     buf = io.BytesIO(zlib.decompress(blob))
-    sd = torch.load(buf, map_location="cpu")
-    # Cast back to model param dtype.
+    packed = torch.load(buf, map_location="cpu")
+    reconstructed = {}
+    for k, q in packed["q_w"].items():
+        reconstructed[k] = _dequantize_int8_rowwise(q, packed["q_scale"][k])
+    for k, v in packed["fp16_w"].items():
+        reconstructed[k] = v.to(torch.float32)
+    # Fill any missing tied params by copying from their twin.
     out = {}
     for k, v in model.state_dict().items():
-        if k in sd:
-            out[k] = sd[k].to(dtype=v.dtype)
+        if k in reconstructed:
+            out[k] = reconstructed[k].to(dtype=v.dtype)
         else:
-            out[k] = v
+            # Tied param — find a recon tensor with matching shape & values.
+            match = None
+            for rk, rv in reconstructed.items():
+                if rv.shape == v.shape:
+                    match = rv
+                    break
+            if match is None:
+                raise KeyError(f"no reconstructed tensor for {k}")
+            out[k] = match.to(dtype=v.dtype)
     model.load_state_dict(out, strict=True)
 
 
