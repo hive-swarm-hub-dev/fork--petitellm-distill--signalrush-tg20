@@ -55,6 +55,7 @@ class HP:
 
     # Optimizer
     lr = float(os.environ.get("LR", 3e-4))
+    lr_min_mult = float(os.environ.get("LR_MIN_MULT", 0.05))  # final lr = lr * lr_min_mult
     weight_decay = float(os.environ.get("WEIGHT_DECAY", 0.0))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
@@ -411,10 +412,15 @@ def main():
         model.parameters(), lr=HP.lr, betas=(HP.beta1, HP.beta2), weight_decay=HP.weight_decay,
     )
 
-    def lr_at(step: int) -> float:
+    lr_min = HP.lr * HP.lr_min_mult
+
+    def lr_at(step: int, elapsed: float) -> float:
         if step < HP.warmup_steps:
             return HP.lr * (step + 1) / HP.warmup_steps
-        return HP.lr
+        # Cosine decay from HP.lr to lr_min over remaining wallclock budget.
+        frac = max(0.0, min(1.0, elapsed / HP.max_wallclock_seconds))
+        cos_w = 0.5 * (1.0 + math.cos(math.pi * frac))
+        return lr_min + (HP.lr - lr_min) * cos_w
 
     start = time.time()
     step = 0
@@ -424,7 +430,7 @@ def main():
         if elapsed >= HP.max_wallclock_seconds:
             break
         for g in opt.param_groups:
-            g["lr"] = lr_at(step)
+            g["lr"] = lr_at(step, elapsed)
 
         x, y, ti, tl = loader.sample_batch(device)
         # Slice teacher cache to requested top_k (<= cached top_k).
