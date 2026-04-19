@@ -362,14 +362,8 @@ def _dequantize_int8_rowwise(q: torch.Tensor, scale: torch.Tensor):
 def save_model_compressed(model: nn.Module, path: str) -> int:
     """Int8 per-row quant for 2D params; fp16 for 1D. zlib-compressed."""
     q_w, q_scale, fp16_w = {}, {}, {}
-    seen_ptr = set()
     for k, v in model.state_dict().items():
         vd = v.detach().cpu()
-        # Dedupe tied params by storage pointer.
-        ptr = vd.data_ptr()
-        if ptr in seen_ptr:
-            continue
-        seen_ptr.add(ptr)
         if vd.dim() == 2 and vd.numel() >= 256:
             q, s = _quantize_int8_rowwise(vd.to(torch.float32))
             q_w[k] = q
@@ -395,21 +389,9 @@ def load_model_compressed(path: str, model: nn.Module):
         reconstructed[k] = _dequantize_int8_rowwise(q, packed["q_scale"][k])
     for k, v in packed["fp16_w"].items():
         reconstructed[k] = v.to(torch.float32)
-    # Fill any missing tied params by copying from their twin.
     out = {}
     for k, v in model.state_dict().items():
-        if k in reconstructed:
-            out[k] = reconstructed[k].to(dtype=v.dtype)
-        else:
-            # Tied param — find a recon tensor with matching shape & values.
-            match = None
-            for rk, rv in reconstructed.items():
-                if rv.shape == v.shape:
-                    match = rv
-                    break
-            if match is None:
-                raise KeyError(f"no reconstructed tensor for {k}")
-            out[k] = match.to(dtype=v.dtype)
+        out[k] = reconstructed[k].to(dtype=v.dtype)
     model.load_state_dict(out, strict=True)
 
 
