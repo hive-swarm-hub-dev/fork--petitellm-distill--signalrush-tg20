@@ -132,6 +132,21 @@ class GPT(nn.Module):
         self.ln_f = nn.LayerNorm(dim)
         self.head = nn.Linear(dim, vocab, bias=False)
         self.head.weight = self.embed.weight  # tied
+        # GPT-2 style init: N(0, 0.02) for linears/embeds, proj layers scaled by sqrt(2L).
+        self.apply(self._init_weights)
+        proj_std = 0.02 / math.sqrt(2 * num_layers)
+        for blk in self.blocks:
+            nn.init.normal_(blk.proj.weight, mean=0.0, std=proj_std)
+            nn.init.normal_(blk.mlp[2].weight, mean=0.0, std=proj_std)
+
+    @staticmethod
+    def _init_weights(m):
+        if isinstance(m, nn.Linear):
+            nn.init.normal_(m.weight, mean=0.0, std=0.02)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+        elif isinstance(m, nn.Embedding):
+            nn.init.normal_(m.weight, mean=0.0, std=0.02)
 
     def forward(self, idx):
         B, T = idx.shape
@@ -256,7 +271,9 @@ def distillation_loss(student_logits, y, teacher_idx, teacher_logp, T: float, al
     t_logp_scaled = teacher_logp / T
     t_logp_norm = t_logp_scaled - torch.logsumexp(t_logp_scaled, dim=-1, keepdim=True)
     t_probs = t_logp_norm.exp()
-    soft = F.kl_div(s_logp, t_probs, reduction="batchmean") * (T * T)
+    # Per-token KL: sum over top-k, mean over (B*T). batchmean on (B,T,K) divides
+    # by B only → off by seq_len, producing huge loss values and unstable training.
+    soft = (t_probs * (t_logp_norm - s_logp)).sum(dim=-1).mean() * (T * T)
     total = alpha * soft + (1.0 - alpha) * hard
     return total, hard.detach(), soft.detach()
 
