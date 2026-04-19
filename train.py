@@ -1,0 +1,452 @@
+"""
+PetiteLLM: Distillation — student training script.
+
+Baseline: small GPT student trained on FineWeb sp1024 with a mixed
+hard-label + soft-label (teacher top-k KL) loss. Student and teacher share
+the sp1024 vocabulary, so teacher top-k indices can be directly gathered
+from student logits.
+
+Outputs (at end of run):
+    final_model.ptz                  zlib-compressed fp16 state dict
+    stdout line: "final_int8_zlib_roundtrip_exact val_bpb:<float>"
+    stdout line: "Total submission size: <bytes> bytes"
+
+Agents should iterate on ARCHITECTURE, OPTIMIZER, DISTILL HPARAMS, QUANTIZATION,
+etc. to minimize val_bpb.
+"""
+from __future__ import annotations
+
+import glob
+import io
+import json
+import math
+import os
+import random
+import sys
+import time
+import zlib
+from pathlib import Path
+
+import numpy as np
+import sentencepiece as spm
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+# ----------------------------- hyperparameters -----------------------------
+
+
+class HP:
+    data_dir = os.environ.get("DATA_DIR", "data/datasets/fineweb10B_sp1024")
+    tokenizer_path = os.environ.get("TOKENIZER_PATH", "data/tokenizers/fineweb_1024_bpe.model")
+    teacher_dir = os.environ.get("TEACHER_DIR", "data/teacher_logits")
+
+    seed = int(os.environ.get("SEED", 1337))
+    max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
+
+    # Student architecture
+    vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
+    num_layers = int(os.environ.get("NUM_LAYERS", 6))
+    model_dim = int(os.environ.get("MODEL_DIM", 384))
+    num_heads = int(os.environ.get("NUM_HEADS", 6))
+    mlp_mult = int(os.environ.get("MLP_MULT", 2))
+    seq_len = int(os.environ.get("SEQ_LEN", 1024))
+
+    # Optimizer
+    lr = float(os.environ.get("LR", 3e-4))
+    weight_decay = float(os.environ.get("WEIGHT_DECAY", 0.0))
+    beta1 = float(os.environ.get("BETA1", 0.9))
+    beta2 = float(os.environ.get("BETA2", 0.95))
+    batch_size = int(os.environ.get("BATCH_SIZE", 16))
+    warmup_steps = int(os.environ.get("WARMUP_STEPS", 100))
+
+    # Distillation
+    distill_alpha = float(os.environ.get("DISTILL_ALPHA", 0.5))
+    distill_temperature = float(os.environ.get("DISTILL_T", 2.0))
+    teacher_top_k = int(os.environ.get("TEACHER_TOP_K", 32))
+
+
+# ----------------------------- model -----------------------------
+
+
+class RotaryEmbedding(nn.Module):
+    def __init__(self, head_dim: int, base: float = 10000.0):
+        super().__init__()
+        inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2).float() / head_dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    def forward(self, seq_len: int, device, dtype):
+        t = torch.arange(seq_len, device=device, dtype=torch.float32)
+        freqs = torch.einsum("i,j->ij", t, self.inv_freq.to(device))
+        emb = torch.cat((freqs, freqs), dim=-1)
+        return emb.cos().to(dtype), emb.sin().to(dtype)
+
+
+def rotate_half(x):
+    x1, x2 = x.chunk(2, dim=-1)
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def apply_rotary(q, k, cos, sin):
+    return (q * cos) + (rotate_half(q) * sin), (k * cos) + (rotate_half(k) * sin)
+
+
+class Block(nn.Module):
+    def __init__(self, dim, num_heads, mlp_mult):
+        super().__init__()
+        assert dim % num_heads == 0
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.ln1 = nn.LayerNorm(dim)
+        self.qkv = nn.Linear(dim, 3 * dim, bias=False)
+        self.proj = nn.Linear(dim, dim, bias=False)
+        self.ln2 = nn.LayerNorm(dim)
+        hidden = dim * mlp_mult
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, hidden, bias=False),
+            nn.GELU(),
+            nn.Linear(hidden, dim, bias=False),
+        )
+
+    def forward(self, x, cos, sin):
+        B, T, D = x.shape
+        h = self.ln1(x)
+        qkv = self.qkv(h).view(B, T, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        q, k = apply_rotary(q, k, cos, sin)
+        attn = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        attn = attn.transpose(1, 2).contiguous().view(B, T, D)
+        x = x + self.proj(attn)
+        x = x + self.mlp(self.ln2(x))
+        return x
+
+
+class GPT(nn.Module):
+    def __init__(self, vocab, dim, num_layers, num_heads, mlp_mult, seq_len):
+        super().__init__()
+        self.seq_len = seq_len
+        self.embed = nn.Embedding(vocab, dim)
+        self.rope = RotaryEmbedding(dim // num_heads)
+        self.blocks = nn.ModuleList([Block(dim, num_heads, mlp_mult) for _ in range(num_layers)])
+        self.ln_f = nn.LayerNorm(dim)
+        self.head = nn.Linear(dim, vocab, bias=False)
+        self.head.weight = self.embed.weight  # tied
+
+    def forward(self, idx):
+        B, T = idx.shape
+        x = self.embed(idx)
+        cos, sin = self.rope(T, idx.device, x.dtype)
+        for blk in self.blocks:
+            x = blk(x, cos, sin)
+        x = self.ln_f(x)
+        return self.head(x)
+
+
+# ----------------------------- data -----------------------------
+
+
+def load_shard(path: str) -> np.ndarray:
+    header = np.fromfile(path, dtype=np.int32, count=256)
+    if len(header) == 0 or header[0] != 20240520:
+        raise ValueError(f"bad shard header in {path}")
+    ntoks = int(header[2])
+    toks = np.memmap(path, dtype=np.uint16, mode="r", offset=256 * 4, shape=(ntoks,))
+    return np.array(toks, dtype=np.uint16)
+
+
+def concat_shards(paths):
+    pieces = [load_shard(p) for p in paths]
+    return np.concatenate(pieces) if len(pieces) > 1 else pieces[0]
+
+
+class DistillationDataLoader:
+    """Yields (x, y, teacher_top_idx, teacher_top_lp) aligned to the teacher cache.
+
+    Reads shards in the exact order recorded in meta.json. Sequence i in the
+    concatenated token stream maps 1:1 to sequence i in the teacher cache,
+    indexed by (i // batch_size) * batch_size + offset.
+    """
+
+    def __init__(self, data_dir: str, teacher_dir: str, seq_len: int, batch_size: int, seed: int):
+        with open(os.path.join(teacher_dir, "meta.json")) as f:
+            meta = json.load(f)
+        self.meta = meta
+        if meta["seq_len"] != seq_len:
+            raise ValueError(f"meta seq_len={meta['seq_len']} != requested {seq_len}")
+        self.top_k = meta["top_k"]
+        self.num_sequences = meta["num_sequences"]
+        self.seq_len = seq_len
+        self.batch_size = batch_size
+
+        shard_paths = [os.path.join(data_dir, name) for name in meta["shard_order"]]
+        for p in shard_paths:
+            if not os.path.exists(p):
+                raise FileNotFoundError(f"shard missing: {p}")
+        self.tokens = concat_shards(shard_paths)
+        assert self.tokens.size >= self.num_sequences * seq_len + 1, \
+            "token stream too short for cached sequences"
+
+        self.indices = np.memmap(
+            os.path.join(teacher_dir, "teacher_topk_indices.bin"),
+            dtype=np.int16, mode="r",
+            shape=(self.num_sequences, seq_len, self.top_k),
+        )
+        self.logprobs = np.memmap(
+            os.path.join(teacher_dir, "teacher_topk_logprobs.bin"),
+            dtype=np.float16, mode="r",
+            shape=(self.num_sequences, seq_len, self.top_k),
+        )
+        self.rng = np.random.default_rng(seed)
+
+    def sample_batch(self, device):
+        idxs = self.rng.integers(0, self.num_sequences, size=self.batch_size)
+        # Build (x, y): x is seq_len tokens; y is shifted-by-one next token.
+        # The teacher logits were cached on x (input of length seq_len), so
+        # student logits at position t predict token x[t+1] == y[t].
+        x_list, y_list = [], []
+        for i in idxs:
+            s = int(i) * self.seq_len
+            e = s + self.seq_len + 1
+            chunk = self.tokens[s:e].astype(np.int64)
+            x_list.append(chunk[:-1])
+            y_list.append(chunk[1:])
+        x = torch.from_numpy(np.stack(x_list)).to(device, non_blocking=True)
+        y = torch.from_numpy(np.stack(y_list)).to(device, non_blocking=True)
+        ti = torch.from_numpy(np.stack([self.indices[i] for i in idxs]).astype(np.int64)).to(device, non_blocking=True)
+        tl = torch.from_numpy(np.stack([self.logprobs[i] for i in idxs]).astype(np.float32)).to(device, non_blocking=True)
+        return x, y, ti, tl
+
+
+def load_val_tokens(data_dir: str, seq_len: int) -> torch.Tensor:
+    paths = sorted(glob.glob(os.path.join(data_dir, "fineweb_val_*.bin")))
+    if not paths:
+        raise FileNotFoundError(f"no fineweb_val_*.bin in {data_dir}")
+    tokens = np.concatenate([load_shard(p) for p in paths]).astype(np.int64)
+    usable = ((tokens.size - 1) // seq_len) * seq_len
+    return torch.from_numpy(tokens[: usable + 1])
+
+
+# ----------------------------- loss -----------------------------
+
+
+def distillation_loss(student_logits, y, teacher_idx, teacher_logp, T: float, alpha: float):
+    """Hard-CE + soft-KL distillation.
+
+    student_logits: (B, T, V)
+    y:              (B, T)        int64 next-token targets
+    teacher_idx:    (B, T, K)     int64 sp1024 token ids
+    teacher_logp:   (B, T, K)     fp32 log-probs over the top-k positions
+    T:              temperature (applied to both saved logprobs and student logits at top-k positions).
+    alpha:          soft-loss weight (0 = pure hard, 1 = pure soft).
+
+    NOTE: applying /T to cached logprobs then renormalizing over the top-k
+    yields a proper distribution, but is not identical to softmax(logits/T)
+    because the non-top-k mass is dropped before renormalization.
+    """
+    B, TT, V = student_logits.shape
+    hard = F.cross_entropy(student_logits.view(-1, V), y.view(-1))
+    if alpha <= 0.0:
+        return hard, hard.detach(), torch.tensor(0.0, device=hard.device)
+
+    # Gather student logits at teacher's top-k positions.
+    student_at_top = student_logits.gather(dim=-1, index=teacher_idx)  # (B, T, K)
+    s_logp = F.log_softmax(student_at_top / T, dim=-1)
+    # Teacher distribution over top-k.
+    t_logp_scaled = teacher_logp / T
+    t_logp_norm = t_logp_scaled - torch.logsumexp(t_logp_scaled, dim=-1, keepdim=True)
+    t_probs = t_logp_norm.exp()
+    soft = F.kl_div(s_logp, t_probs, reduction="batchmean") * (T * T)
+    total = alpha * soft + (1.0 - alpha) * hard
+    return total, hard.detach(), soft.detach()
+
+
+# ----------------------------- bpb evaluation -----------------------------
+
+
+def build_byte_lut(sp_model_path: str, vocab_size: int, device: torch.device):
+    sp = spm.SentencePieceProcessor(model_file=sp_model_path)
+    sp_v = int(sp.vocab_size())
+    table = max(sp_v, vocab_size)
+    base_bytes = np.zeros((table,), dtype=np.int16)
+    has_space = np.zeros((table,), dtype=np.bool_)
+    is_boundary = np.ones((table,), dtype=np.bool_)
+    for tok in range(sp_v):
+        if sp.is_control(tok) or sp.is_unknown(tok) or sp.is_unused(tok):
+            continue
+        is_boundary[tok] = False
+        if sp.is_byte(tok):
+            base_bytes[tok] = 1
+            continue
+        piece = sp.id_to_piece(tok)
+        if piece.startswith("▁"):
+            has_space[tok] = True
+            piece = piece[1:]
+        base_bytes[tok] = len(piece.encode("utf-8"))
+    return (
+        torch.from_numpy(base_bytes).to(device),
+        torch.from_numpy(has_space).to(device),
+        torch.from_numpy(is_boundary).to(device),
+    )
+
+
+@torch.inference_mode()
+def eval_val_bpb(model, val_tokens: torch.Tensor, seq_len: int, device, base_bytes_lut, has_space_lut, is_boundary_lut, batch_seqs: int = 16):
+    model.eval()
+    total_loss = 0.0
+    total_tokens = 0
+    total_bytes = 0
+    n = val_tokens.numel()
+    total_seqs = (n - 1) // seq_len
+    for bstart in range(0, total_seqs, batch_seqs):
+        bend = min(bstart + batch_seqs, total_seqs)
+        seqs = []
+        for i in range(bstart, bend):
+            s = i * seq_len
+            seqs.append(val_tokens[s : s + seq_len + 1])
+        chunk = torch.stack(seqs).to(device, non_blocking=True)
+        x = chunk[:, :-1]
+        y = chunk[:, 1:]
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            logits = model(x)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.reshape(-1), reduction="sum").float()
+        total_loss += loss.item()
+        total_tokens += y.numel()
+        # Bytes-per-token via sp LUT.
+        prev_ids = x.reshape(-1)
+        tgt_ids = y.reshape(-1)
+        tb = base_bytes_lut[tgt_ids].to(torch.int64)
+        tb = tb + (has_space_lut[tgt_ids] & ~is_boundary_lut[prev_ids]).to(torch.int64)
+        total_bytes += int(tb.sum().item())
+    model.train()
+    if total_tokens == 0 or total_bytes == 0:
+        return float("inf"), float("inf")
+    bits_per_tok = (total_loss / total_tokens) / math.log(2.0)
+    toks_per_byte = total_tokens / total_bytes
+    return total_loss / total_tokens, bits_per_tok * toks_per_byte
+
+
+# ----------------------------- quantize + save -----------------------------
+
+
+def save_model_compressed(model: nn.Module, path: str) -> int:
+    """Save model state dict in fp16, zlib-compressed. Returns file bytes.
+
+    Agents: replace with int8 per-row + zlib for better compression; see
+    parameter-golf's quantize_state_dict_int8 as a reference.
+    """
+    sd = {k: v.detach().to(torch.float16).cpu() for k, v in model.state_dict().items()}
+    buf = io.BytesIO()
+    torch.save(sd, buf)
+    blob = zlib.compress(buf.getvalue(), level=9)
+    with open(path, "wb") as f:
+        f.write(blob)
+    return os.path.getsize(path)
+
+
+def load_model_compressed(path: str, model: nn.Module):
+    with open(path, "rb") as f:
+        blob = f.read()
+    buf = io.BytesIO(zlib.decompress(blob))
+    sd = torch.load(buf, map_location="cpu")
+    # Cast back to model param dtype.
+    out = {}
+    for k, v in model.state_dict().items():
+        if k in sd:
+            out[k] = sd[k].to(dtype=v.dtype)
+        else:
+            out[k] = v
+    model.load_state_dict(out, strict=True)
+
+
+# ----------------------------- main -----------------------------
+
+
+def main():
+    random.seed(HP.seed); np.random.seed(HP.seed); torch.manual_seed(HP.seed)
+    if not torch.cuda.is_available():
+        print("ERROR: CUDA required", file=sys.stderr)
+        sys.exit(1)
+    device = torch.device("cuda")
+
+    # Build model
+    model = GPT(
+        vocab=HP.vocab_size, dim=HP.model_dim, num_layers=HP.num_layers,
+        num_heads=HP.num_heads, mlp_mult=HP.mlp_mult, seq_len=HP.seq_len,
+    ).to(device)
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"student params: {total_params/1e6:.2f}M  dim={HP.model_dim} layers={HP.num_layers}")
+
+    # Data
+    loader = DistillationDataLoader(
+        data_dir=HP.data_dir, teacher_dir=HP.teacher_dir,
+        seq_len=HP.seq_len, batch_size=HP.batch_size, seed=HP.seed,
+    )
+    assert loader.top_k >= HP.teacher_top_k, (
+        f"meta.json top_k={loader.top_k} < requested TEACHER_TOP_K={HP.teacher_top_k}"
+    )
+    top_k = HP.teacher_top_k
+
+    val_tokens = load_val_tokens(HP.data_dir, HP.seq_len)
+    base_lut, space_lut, boundary_lut = build_byte_lut(HP.tokenizer_path, HP.vocab_size, device)
+
+    opt = torch.optim.AdamW(
+        model.parameters(), lr=HP.lr, betas=(HP.beta1, HP.beta2), weight_decay=HP.weight_decay,
+    )
+
+    def lr_at(step: int) -> float:
+        if step < HP.warmup_steps:
+            return HP.lr * (step + 1) / HP.warmup_steps
+        return HP.lr
+
+    start = time.time()
+    step = 0
+    model.train()
+    while True:
+        elapsed = time.time() - start
+        if elapsed >= HP.max_wallclock_seconds:
+            break
+        for g in opt.param_groups:
+            g["lr"] = lr_at(step)
+
+        x, y, ti, tl = loader.sample_batch(device)
+        # Slice teacher cache to requested top_k (<= cached top_k).
+        ti = ti[..., :top_k]
+        tl = tl[..., :top_k]
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            logits = model(x)
+            loss, hard_l, soft_l = distillation_loss(
+                logits, y, ti, tl, T=HP.distill_temperature, alpha=HP.distill_alpha,
+            )
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+        step += 1
+        if step % 50 == 0:
+            print(
+                f"step={step} elapsed={elapsed:.0f}s loss={loss.item():.4f} "
+                f"hard={hard_l.item():.4f} soft={soft_l.item():.4f} lr={opt.param_groups[0]['lr']:.2e}",
+                flush=True,
+            )
+
+    print(f"training done: {step} steps in {time.time()-start:.0f}s")
+
+    # Save + reload (compression round-trip) so val_bpb reflects the compressed model.
+    artifact_path = "final_model.ptz"
+    model_bytes = save_model_compressed(model, artifact_path)
+    code_bytes = os.path.getsize(__file__)
+    total_bytes = model_bytes + code_bytes
+    print(f"final_model.ptz: {model_bytes} bytes")
+    print(f"train.py:        {code_bytes} bytes")
+    print(f"Total submission size: {total_bytes} bytes")
+
+    load_model_compressed(artifact_path, model)
+    val_loss, val_bpb = eval_val_bpb(
+        model, val_tokens, HP.seq_len, device, base_lut, space_lut, boundary_lut,
+    )
+    # Parameter-golf-compatible output line so eval/eval.sh regex matches:
+    print(f"final_int8_zlib_roundtrip_exact val_loss:{val_loss:.8f} val_bpb:{val_bpb:.8f}")
+
+
+if __name__ == "__main__":
+    main()

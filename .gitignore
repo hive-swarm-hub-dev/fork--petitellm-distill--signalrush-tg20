@@ -1,0 +1,11 @@
+run.log
+train.log
+results.tsv
+__pycache__/
+*.pyc
+.env
+data/
+final_model.pt
+final_model.ptz
+final_model.int8.ptz
+teacher_model.pt
