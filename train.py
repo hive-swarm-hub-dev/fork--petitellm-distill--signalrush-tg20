@@ -101,11 +101,12 @@ def apply_rotary(q, k, cos, sin):
 
 
 class Block(nn.Module):
-    def __init__(self, dim, num_heads, mlp_mult):
+    def __init__(self, dim, num_heads, mlp_mult, is_first=False):
         super().__init__()
         assert dim % num_heads == 0
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
+        self.is_first = is_first
         self.ln1 = nn.LayerNorm(dim)
         self.qkv = nn.Linear(dim, 3 * dim, bias=False)
         self.proj = nn.Linear(dim, dim, bias=False)
@@ -116,18 +117,26 @@ class Block(nn.Module):
             nn.GELU(),
             nn.Linear(hidden, dim, bias=False),
         )
+        # Value residual [Zhu et al. 2024]: non-first layers learn a blend
+        # between their own v and layer-0's v. Init 0.5 = equal mix.
+        if not is_first:
+            self.lambda_v = nn.Parameter(torch.tensor(0.5))
 
-    def forward(self, x, cos, sin):
+    def forward(self, x, cos, sin, v_first):
         B, T, D = x.shape
         h = self.ln1(x)
         qkv = self.qkv(h).view(B, T, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
         q, k = apply_rotary(q, k, cos, sin)
+        if self.is_first:
+            v_first = v
+        else:
+            v = self.lambda_v * v_first + (1.0 - self.lambda_v) * v
         attn = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         attn = attn.transpose(1, 2).contiguous().view(B, T, D)
         x = x + self.proj(attn)
         x = x + self.mlp(self.ln2(x))
-        return x
+        return x, v_first
 
 
 class GPT(nn.Module):
@@ -136,7 +145,10 @@ class GPT(nn.Module):
         self.seq_len = seq_len
         self.embed = nn.Embedding(vocab, dim)
         self.rope = RotaryEmbedding(dim // num_heads)
-        self.blocks = nn.ModuleList([Block(dim, num_heads, mlp_mult) for _ in range(num_layers)])
+        self.blocks = nn.ModuleList([
+            Block(dim, num_heads, mlp_mult, is_first=(i == 0))
+            for i in range(num_layers)
+        ])
         self.ln_f = nn.LayerNorm(dim)
         # Untied head with zero init (nanoGPT speedrun): input embedding and
         # output projection play different roles; untying adds ~460K params and
@@ -165,8 +177,9 @@ class GPT(nn.Module):
         B, T = idx.shape
         x = self.embed(idx)
         cos, sin = self.rope(T, idx.device, x.dtype)
+        v_first = None
         for blk in self.blocks:
-            x = blk(x, cos, sin)
+            x, v_first = blk(x, cos, sin, v_first)
         x = self.ln_f(x)
         return self.head(x)
 
