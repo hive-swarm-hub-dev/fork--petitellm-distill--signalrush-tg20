@@ -181,7 +181,9 @@ class GPT(nn.Module):
         for blk in self.blocks:
             x, v_first = blk(x, cos, sin, v_first)
         x = self.ln_f(x)
-        return self.head(x)
+        logits = self.head(x)
+        # Logit softcapping [Gemma2]: prevents logit magnitude explosion.
+        return 30.0 * torch.tanh(logits / 30.0)
 
 
 # ----------------------------- data -----------------------------
