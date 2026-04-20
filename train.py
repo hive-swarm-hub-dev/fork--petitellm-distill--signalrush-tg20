@@ -138,14 +138,19 @@ class GPT(nn.Module):
         self.rope = RotaryEmbedding(dim // num_heads)
         self.blocks = nn.ModuleList([Block(dim, num_heads, mlp_mult) for _ in range(num_layers)])
         self.ln_f = nn.LayerNorm(dim)
+        # Untied head with zero init (nanoGPT speedrun): input embedding and
+        # output projection play different roles; untying adds ~460K params and
+        # zero init starts logits uniform so no token is preferred before training.
         self.head = nn.Linear(dim, vocab, bias=False)
-        self.head.weight = self.embed.weight  # tied
         # GPT-2 style init: N(0, 0.02) for linears/embeds, proj layers scaled by sqrt(2L).
         self.apply(self._init_weights)
         proj_std = 0.02 / math.sqrt(2 * num_layers)
         for blk in self.blocks:
             nn.init.normal_(blk.proj.weight, mean=0.0, std=proj_std)
             nn.init.normal_(blk.mlp[2].weight, mean=0.0, std=proj_std)
+        # Zero-init the output head. CE with uniform predictions starts at
+        # log(vocab) and gradients are pure signal (no random head to fight).
+        nn.init.zeros_(self.head.weight)
 
     @staticmethod
     def _init_weights(m):
