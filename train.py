@@ -107,10 +107,10 @@ class Block(nn.Module):
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.is_first = is_first
-        self.ln1 = nn.LayerNorm(dim)
+        self.ln1 = nn.RMSNorm(dim)
         self.qkv = nn.Linear(dim, 3 * dim, bias=False)
         self.proj = nn.Linear(dim, dim, bias=False)
-        self.ln2 = nn.LayerNorm(dim)
+        self.ln2 = nn.RMSNorm(dim)
         hidden = dim * mlp_mult
         self.mlp = nn.Sequential(
             nn.Linear(dim, hidden, bias=False),
@@ -149,7 +149,7 @@ class GPT(nn.Module):
             Block(dim, num_heads, mlp_mult, is_first=(i == 0))
             for i in range(num_layers)
         ])
-        self.ln_f = nn.LayerNorm(dim)
+        self.ln_f = nn.RMSNorm(dim)
         # Untied head with zero init (nanoGPT speedrun): input embedding and
         # output projection play different roles; untying adds ~460K params and
         # zero init starts logits uniform so no token is preferred before training.
