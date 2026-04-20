@@ -54,7 +54,7 @@ class HP:
     seq_len = int(os.environ.get("SEQ_LEN", 1024))
 
     # Optimizer
-    lr = float(os.environ.get("LR", 3e-4))
+    lr = float(os.environ.get("LR", 4e-4))
     lr_min_mult = float(os.environ.get("LR_MIN_MULT", 0.05))  # final lr = lr * lr_min_mult
     weight_decay = float(os.environ.get("WEIGHT_DECAY", 0.1))
     beta1 = float(os.environ.get("BETA1", 0.9))
