@@ -56,7 +56,7 @@ class HP:
     # Optimizer
     lr = float(os.environ.get("LR", 3e-4))
     lr_min_mult = float(os.environ.get("LR_MIN_MULT", 0.05))  # final lr = lr * lr_min_mult
-    weight_decay = float(os.environ.get("WEIGHT_DECAY", 0.0))
+    weight_decay = float(os.environ.get("WEIGHT_DECAY", 0.1))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     batch_size = int(os.environ.get("BATCH_SIZE", 16))
@@ -66,6 +66,11 @@ class HP:
     distill_alpha = float(os.environ.get("DISTILL_ALPHA", 0.5))
     distill_temperature = float(os.environ.get("DISTILL_T", 2.0))
     teacher_top_k = int(os.environ.get("TEACHER_TOP_K", 32))
+    # Fraction of batches that use cached-teacher sequences (the rest sample
+    # anywhere in the raw shards with hard-CE only). Teacher cache covers
+    # only ~10M tokens but shards have ~200M — expanding the pool prevents
+    # the student from memorizing the 9766 cached sequences.
+    teacher_batch_frac = float(os.environ.get("TEACHER_BATCH_FRAC", 0.5))
 
 
 # ----------------------------- model -----------------------------
@@ -184,7 +189,7 @@ class DistillationDataLoader:
     indexed by (i // batch_size) * batch_size + offset.
     """
 
-    def __init__(self, data_dir: str, teacher_dir: str, seq_len: int, batch_size: int, seed: int):
+    def __init__(self, data_dir: str, teacher_dir: str, seq_len: int, batch_size: int, seed: int, teacher_batch_frac: float = 0.5):
         with open(os.path.join(teacher_dir, "meta.json")) as f:
             meta = json.load(f)
         self.meta = meta
@@ -194,6 +199,7 @@ class DistillationDataLoader:
         self.num_sequences = meta["num_sequences"]
         self.seq_len = seq_len
         self.batch_size = batch_size
+        self.teacher_batch_frac = teacher_batch_frac
 
         shard_paths = [os.path.join(data_dir, name) for name in meta["shard_order"]]
         for p in shard_paths:
@@ -202,6 +208,8 @@ class DistillationDataLoader:
         self.tokens = concat_shards(shard_paths)
         assert self.tokens.size >= self.num_sequences * seq_len + 1, \
             "token stream too short for cached sequences"
+        # Total sequences available in the raw shards (200M tokens).
+        self.total_raw_seqs = (self.tokens.size - 1) // seq_len
 
         self.indices = np.memmap(
             os.path.join(teacher_dir, "teacher_topk_indices.bin"),
@@ -216,10 +224,13 @@ class DistillationDataLoader:
         self.rng = np.random.default_rng(seed)
 
     def sample_batch(self, device):
-        idxs = self.rng.integers(0, self.num_sequences, size=self.batch_size)
-        # Build (x, y): x is seq_len tokens; y is shifted-by-one next token.
-        # The teacher logits were cached on x (input of length seq_len), so
-        # student logits at position t predict token x[t+1] == y[t].
+        # Per-batch decision: cached+distill, or raw+hard-only.
+        use_teacher = self.rng.random() < self.teacher_batch_frac
+        if use_teacher:
+            idxs = self.rng.integers(0, self.num_sequences, size=self.batch_size)
+        else:
+            idxs = self.rng.integers(0, self.total_raw_seqs, size=self.batch_size)
+        # Build (x, y) from the concatenated token stream.
         x_list, y_list = [], []
         for i in idxs:
             s = int(i) * self.seq_len
@@ -229,9 +240,12 @@ class DistillationDataLoader:
             y_list.append(chunk[1:])
         x = torch.from_numpy(np.stack(x_list)).to(device, non_blocking=True)
         y = torch.from_numpy(np.stack(y_list)).to(device, non_blocking=True)
-        ti = torch.from_numpy(np.stack([self.indices[i] for i in idxs]).astype(np.int64)).to(device, non_blocking=True)
-        tl = torch.from_numpy(np.stack([self.logprobs[i] for i in idxs]).astype(np.float32)).to(device, non_blocking=True)
-        return x, y, ti, tl
+        if use_teacher:
+            ti = torch.from_numpy(np.stack([self.indices[i] for i in idxs]).astype(np.int64)).to(device, non_blocking=True)
+            tl = torch.from_numpy(np.stack([self.logprobs[i] for i in idxs]).astype(np.float32)).to(device, non_blocking=True)
+        else:
+            ti, tl = None, None
+        return x, y, ti, tl, use_teacher
 
 
 def load_val_tokens(data_dir: str, seq_len: int) -> torch.Tensor:
@@ -417,6 +431,7 @@ def main():
     loader = DistillationDataLoader(
         data_dir=HP.data_dir, teacher_dir=HP.teacher_dir,
         seq_len=HP.seq_len, batch_size=HP.batch_size, seed=HP.seed,
+        teacher_batch_frac=HP.teacher_batch_frac,
     )
     assert loader.top_k >= HP.teacher_top_k, (
         f"meta.json top_k={loader.top_k} < requested TEACHER_TOP_K={HP.teacher_top_k}"
@@ -450,15 +465,20 @@ def main():
         for g in opt.param_groups:
             g["lr"] = lr_at(step, elapsed)
 
-        x, y, ti, tl = loader.sample_batch(device)
-        # Slice teacher cache to requested top_k (<= cached top_k).
-        ti = ti[..., :top_k]
-        tl = tl[..., :top_k]
+        x, y, ti, tl, use_teacher = loader.sample_batch(device)
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             logits = model(x)
-            loss, hard_l, soft_l = distillation_loss(
-                logits, y, ti, tl, T=HP.distill_temperature, alpha=HP.distill_alpha,
-            )
+            if use_teacher:
+                ti = ti[..., :top_k]
+                tl = tl[..., :top_k]
+                loss, hard_l, soft_l = distillation_loss(
+                    logits, y, ti, tl, T=HP.distill_temperature, alpha=HP.distill_alpha,
+                )
+            else:
+                V = logits.size(-1)
+                loss = F.cross_entropy(logits.view(-1, V), y.view(-1))
+                hard_l = loss.detach()
+                soft_l = torch.tensor(0.0, device=loss.device)
         opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()
