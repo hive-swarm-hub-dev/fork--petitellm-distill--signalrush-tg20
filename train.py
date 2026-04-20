@@ -47,7 +47,7 @@ class HP:
 
     # Student architecture
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 8))
+    num_layers = int(os.environ.get("NUM_LAYERS", 9))
     model_dim = int(os.environ.get("MODEL_DIM", 448))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
