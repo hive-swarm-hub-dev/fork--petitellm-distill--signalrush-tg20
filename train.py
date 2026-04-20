@@ -54,7 +54,9 @@ class HP:
     seq_len = int(os.environ.get("SEQ_LEN", 1024))
 
     # Optimizer
-    lr = float(os.environ.get("LR", 4e-4))
+    lr = float(os.environ.get("LR", 4e-4))          # AdamW lr (for embeds/LN/biases)
+    muon_lr = float(os.environ.get("MUON_LR", 0.02))  # Muon lr (for hidden 2D weights)
+    muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     lr_min_mult = float(os.environ.get("LR_MIN_MULT", 0.05))  # final lr = lr * lr_min_mult
     weight_decay = float(os.environ.get("WEIGHT_DECAY", 0.1))
     beta1 = float(os.environ.get("BETA1", 0.9))
@@ -257,6 +259,70 @@ def load_val_tokens(data_dir: str, seq_len: int) -> torch.Tensor:
     return torch.from_numpy(tokens[: usable + 1])
 
 
+# ----------------------------- muon optimizer -----------------------------
+
+
+@torch.no_grad()
+def zeropower_via_newtonschulz5(G: torch.Tensor, steps: int = 5, eps: float = 1e-7) -> torch.Tensor:
+    """Newton-Schulz iteration to approximate the orthogonal matrix G(G^TG)^{-1/2}.
+
+    From Keller Jordan's Muon optimizer (arxiv 2024). Uses quintic polynomial
+    coefficients (3.4445, -4.7750, 2.0315) for fast convergence from random-init
+    matrices with singular values in [0, 1.2] range.
+    """
+    assert G.ndim == 2
+    a, b, c = 3.4445, -4.7750, 2.0315
+    X = G.to(torch.bfloat16)
+    X = X / (X.norm() + eps)
+    transposed = G.size(0) > G.size(1)
+    if transposed:
+        X = X.T
+    for _ in range(steps):
+        A = X @ X.T
+        B = b * A + c * (A @ A)
+        X = a * X + B @ X
+    if transposed:
+        X = X.T
+    return X.to(G.dtype)
+
+
+class Muon(torch.optim.Optimizer):
+    """Muon: momentum+Newton-Schulz orthogonalization for 2D matrix params.
+
+    Per Keller Jordan (2024), the current nanoGPT speedrun winner. Meant for
+    hidden 2D linear layers (qkv, proj, mlp.*); use AdamW for embeddings,
+    LayerNorms, and biases.
+    """
+
+    def __init__(self, params, lr: float = 0.02, momentum: float = 0.95,
+                 nesterov: bool = True, ns_steps: int = 5):
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self):
+        for group in self.param_groups:
+            lr = group["lr"]
+            momentum = group["momentum"]
+            nesterov = group["nesterov"]
+            ns_steps = group["ns_steps"]
+            for p in group["params"]:
+                g = p.grad
+                if g is None:
+                    continue
+                state = self.state[p]
+                if "mb" not in state:
+                    state["mb"] = torch.zeros_like(g)
+                buf = state["mb"]
+                buf.mul_(momentum).add_(g)
+                g_mom = g.add(buf, alpha=momentum) if nesterov else buf
+                update = zeropower_via_newtonschulz5(g_mom, steps=ns_steps)
+                # Muon's rectangular-matrix correction: scale by sqrt(fan_out/fan_in)
+                # so that wider-than-tall matrices get proportionally bigger updates.
+                scale = max(1.0, (p.size(0) / p.size(1)) ** 0.5)
+                p.data.add_(update, alpha=-lr * scale)
+
+
 # ----------------------------- loss -----------------------------
 
 
@@ -441,19 +507,35 @@ def main():
     val_tokens = load_val_tokens(HP.data_dir, HP.seq_len)
     base_lut, space_lut, boundary_lut = build_byte_lut(HP.tokenizer_path, HP.vocab_size, device)
 
-    opt = torch.optim.AdamW(
-        model.parameters(), lr=HP.lr, betas=(HP.beta1, HP.beta2), weight_decay=HP.weight_decay,
+    # Split params: Muon for hidden 2D linear weights, AdamW for everything else.
+    muon_params, adamw_params = [], []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        # Hidden 2D weights in the transformer blocks.
+        if p.ndim == 2 and name.startswith("blocks."):
+            muon_params.append(p)
+        else:
+            adamw_params.append(p)
+    print(f"optimizer split: muon={sum(p.numel() for p in muon_params)/1e6:.2f}M  "
+          f"adamw={sum(p.numel() for p in adamw_params)/1e6:.2f}M", flush=True)
+
+    opt_adamw = torch.optim.AdamW(
+        adamw_params, lr=HP.lr, betas=(HP.beta1, HP.beta2), weight_decay=HP.weight_decay,
+    )
+    opt_muon = Muon(
+        muon_params, lr=HP.muon_lr, momentum=HP.muon_momentum, nesterov=True, ns_steps=5,
     )
 
-    lr_min = HP.lr * HP.lr_min_mult
+    adamw_lr_min = HP.lr * HP.lr_min_mult
+    muon_lr_min = HP.muon_lr * HP.lr_min_mult
 
-    def lr_at(step: int, elapsed: float) -> float:
+    def cosine_schedule(peak: float, floor: float, step: int, elapsed: float) -> float:
         if step < HP.warmup_steps:
-            return HP.lr * (step + 1) / HP.warmup_steps
-        # Cosine decay from HP.lr to lr_min over remaining wallclock budget.
+            return peak * (step + 1) / HP.warmup_steps
         frac = max(0.0, min(1.0, elapsed / HP.max_wallclock_seconds))
         cos_w = 0.5 * (1.0 + math.cos(math.pi * frac))
-        return lr_min + (HP.lr - lr_min) * cos_w
+        return floor + (peak - floor) * cos_w
 
     start = time.time()
     step = 0
@@ -462,8 +544,10 @@ def main():
         elapsed = time.time() - start
         if elapsed >= HP.max_wallclock_seconds:
             break
-        for g in opt.param_groups:
-            g["lr"] = lr_at(step, elapsed)
+        for g in opt_adamw.param_groups:
+            g["lr"] = cosine_schedule(HP.lr, adamw_lr_min, step, elapsed)
+        for g in opt_muon.param_groups:
+            g["lr"] = cosine_schedule(HP.muon_lr, muon_lr_min, step, elapsed)
 
         x, y, ti, tl, use_teacher = loader.sample_batch(device)
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -479,14 +563,18 @@ def main():
                 loss = F.cross_entropy(logits.view(-1, V), y.view(-1))
                 hard_l = loss.detach()
                 soft_l = torch.tensor(0.0, device=loss.device)
-        opt.zero_grad(set_to_none=True)
+        opt_adamw.zero_grad(set_to_none=True)
+        opt_muon.zero_grad(set_to_none=True)
         loss.backward()
-        opt.step()
+        opt_adamw.step()
+        opt_muon.step()
         step += 1
         if step % 50 == 0:
             print(
                 f"step={step} elapsed={elapsed:.0f}s loss={loss.item():.4f} "
-                f"hard={hard_l.item():.4f} soft={soft_l.item():.4f} lr={opt.param_groups[0]['lr']:.2e}",
+                f"hard={hard_l.item():.4f} soft={soft_l.item():.4f} "
+                f"adamw_lr={opt_adamw.param_groups[0]['lr']:.2e} "
+                f"muon_lr={opt_muon.param_groups[0]['lr']:.2e}",
                 flush=True,
             )
 
