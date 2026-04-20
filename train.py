@@ -262,15 +262,13 @@ def load_val_tokens(data_dir: str, seq_len: int) -> torch.Tensor:
 # ----------------------------- muon optimizer -----------------------------
 
 
-@torch.no_grad()
-def zeropower_via_newtonschulz5(G: torch.Tensor, steps: int = 5, eps: float = 1e-7) -> torch.Tensor:
-    """Newton-Schulz iteration to approximate the orthogonal matrix G(G^TG)^{-1/2}.
+def _zeropower_via_newtonschulz5_eager(G: torch.Tensor, steps: int = 5, eps: float = 1e-7) -> torch.Tensor:
+    """Newton-Schulz iteration to approximate G(G^TG)^{-1/2}.
 
-    From Keller Jordan's Muon optimizer (arxiv 2024). Uses quintic polynomial
-    coefficients (3.4445, -4.7750, 2.0315) for fast convergence from random-init
-    matrices with singular values in [0, 1.2] range.
+    From Keller Jordan's Muon optimizer (2024). Quintic polynomial coefficients
+    (3.4445, -4.7750, 2.0315) converge fast for matrices with singular values
+    bounded in [0, 1.2]. The Frobenius-norm division normalizes to that range.
     """
-    assert G.ndim == 2
     a, b, c = 3.4445, -4.7750, 2.0315
     X = G.to(torch.bfloat16)
     X = X / (X.norm() + eps)
@@ -284,6 +282,14 @@ def zeropower_via_newtonschulz5(G: torch.Tensor, steps: int = 5, eps: float = 1e
     if transposed:
         X = X.T
     return X.to(G.dtype)
+
+
+# torch.compile the inner NS function — nanoGPT speedrun does this to hide the
+# NS iteration overhead (usually ~20% of per-step time on small Muon workloads).
+try:
+    zeropower_via_newtonschulz5 = torch.compile(_zeropower_via_newtonschulz5_eager, dynamic=False)
+except Exception:
+    zeropower_via_newtonschulz5 = _zeropower_via_newtonschulz5_eager
 
 
 class Muon(torch.optim.Optimizer):
