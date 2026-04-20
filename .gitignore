@@ -10,3 +10,4 @@ final_model.pt
 final_model.ptz
 final_model.int8.ptz
 teacher_model.pt
+.claude/
