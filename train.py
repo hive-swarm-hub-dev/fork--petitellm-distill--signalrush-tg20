@@ -70,7 +70,7 @@ class HP:
     # anywhere in the raw shards with hard-CE only). Teacher cache covers
     # only ~10M tokens but shards have ~200M — expanding the pool prevents
     # the student from memorizing the 9766 cached sequences.
-    teacher_batch_frac = float(os.environ.get("TEACHER_BATCH_FRAC", 0.25))
+    teacher_batch_frac = float(os.environ.get("TEACHER_BATCH_FRAC", 0.1))
 
 
 # ----------------------------- model -----------------------------
